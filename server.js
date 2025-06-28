@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
 const xlsx = require('xlsx');
@@ -5,156 +6,334 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs-extra');
 const { v4: uuidv4 } = require('uuid');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Configure CORS
-app.use(cors());
+// Enhanced CORS configuration
+app.use(cors({
+  origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  exposedHeaders: ['Content-Disposition']
+}));
+
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Set up temporary directories
-const uploadDir = path.join(__dirname, 'temp', 'uploads');
-const outputDir = path.join(__dirname, 'temp', 'output');
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later'
+});
+app.use(limiter);
 
-fs.ensureDirSync(uploadDir);
-fs.ensureDirSync(outputDir);
+// Configure temporary directories
+const tempDir = path.join(__dirname, 'temp');
+const uploadDir = path.join(tempDir, 'uploads');
+const outputDir = path.join(tempDir, 'output');
 
-// Configure multer for file uploads
+// Ensure directories exist and are clean
+async function initializeDirectories() {
+  try {
+    await fs.ensureDir(uploadDir);
+    await fs.ensureDir(outputDir);
+    await fs.emptyDir(uploadDir);
+    await fs.emptyDir(outputDir);
+    console.log('Directories initialized successfully');
+  } catch (err) {
+    console.error('Directory initialization failed:', err);
+    process.exit(1);
+  }
+}
+
+// Configure multer with enhanced file handling
 const storage = multer.diskStorage({
-  destination: uploadDir,
+  destination: (req, file, cb) => {
+    cb(null, uploadDir);
+  },
   filename: (req, file, cb) => {
     const uniqueName = `${uuidv4()}${path.extname(file.originalname)}`;
     cb(null, uniqueName);
   }
 });
 
-const upload = multer({ 
+const fileFilter = (req, file, cb) => {
+  const filetypes = /xlsx|xls|csv/;
+  const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
+  const mimetype = filetypes.test(file.mimetype);
+
+  if (mimetype && extname) {
+    cb(null, true);
+  } else {
+    cb(new Error('Only Excel/CSV files are allowed!'), false);
+  }
+};
+
+const upload = multer({
   storage,
-  fileFilter: (req, file, cb) => {
-    if (file.mimetype.includes('excel') || file.mimetype.includes('spreadsheet') || 
-        path.extname(file.originalname).match(/\.(xlsx|xls)$/)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only Excel files are allowed!'), false);
-    }
-  },
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+  fileFilter,
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB
+    files: 1
+  }
 });
 
-// Clean up temp files on server start
-async function cleanTempFiles() {
-  try {
-    await fs.emptyDir(uploadDir);
-    await fs.emptyDir(outputDir);
-    console.log('Temporary directories cleaned');
-  } catch (err) {
-    console.error('Error cleaning temp directories:', err);
-  }
-}
+// Enhanced Excel date parser
+function parseExcelDate(value) {
+  if (!value) return null;
 
-cleanTempFiles();
-
-// Helper function to parse dates from Excel
-function parseExcelDate(excelDate) {
   try {
-    if (typeof excelDate === 'number') {
-      // Excel dates are numbers where 1 = 1900-01-01
+    // Handle Excel numeric dates (days since 1900-01-01)
+    if (typeof value === 'number') {
       const excelEpoch = new Date(1899, 11, 30);
-      const date = new Date(excelEpoch.getTime() + (excelDate - 1) * 86400000);
+      const date = new Date(excelEpoch.getTime() + (value - 1) * 86400000);
       return date.toISOString().split('T')[0];
-    } else if (typeof excelDate === 'string') {
-      // Handle string dates in format "DD-MM-YYYY"
-      const parts = excelDate.split(/[-/]/);
-      if (parts.length === 3) {
-        const date = new Date(`${parts[2]}-${parts[1]}-${parts[0]}`);
-        return date.toISOString().split('T')[0];
+    }
+
+    // Handle string dates (DD-MM-YYYY or MM/DD/YYYY)
+    if (typeof value === 'string') {
+      // Try common separators
+      const separators = ['-', '/', '.'];
+      for (const sep of separators) {
+        const parts = value.split(sep);
+        if (parts.length === 3) {
+          // Try both day-first and month-first formats
+          const formats = [
+            `${parts[2]}-${parts[1]}-${parts[0]}`, // DD-MM-YYYY
+            `${parts[2]}-${parts[0]}-${parts[1]}`  // MM-DD-YYYY
+          ];
+          
+          for (const format of formats) {
+            const date = new Date(format);
+            if (!isNaN(date.getTime())) {
+              return date.toISOString().split('T')[0];
+            }
+          }
+        }
       }
     }
-    // Try parsing as ISO date
-    const date = new Date(excelDate);
-    return date.toISOString().split('T')[0];
+
+    // Fallback to native Date parsing
+    const date = new Date(value);
+    if (!isNaN(date.getTime())) {
+      return date.toISOString().split('T')[0];
+    }
+
+    return null;
   } catch (err) {
+    console.error('Date parsing error:', { value, error: err.message });
     return null;
   }
 }
 
 // API Endpoints
 
-// Upload Excel file and extract merchants
+/**
+ * @api {post} /upload Upload Excel File
+ * @apiName UploadFile
+ * @apiGroup File
+ * 
+ * @apiParam {File} file Excel file to upload
+ * 
+ * @apiSuccess {String[]} merchants List of merchant names
+ * @apiSuccess {Number} count Number of transactions processed
+ */
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
+    // Validate file
     if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+      return res.status(400).json({
+        success: false,
+        error: 'NO_FILE',
+        message: 'No file was uploaded',
+        solution: 'Please select an Excel file to upload'
+      });
     }
 
-    const filePath = req.file.path;
-    const workbook = xlsx.readFile(filePath);
+    // Verify file exists
+    try {
+      await fs.access(req.file.path);
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: 'FILE_ACCESS_ERROR',
+        message: 'Uploaded file could not be accessed',
+        details: err.message
+      });
+    }
+
+    // Process Excel file
+    let workbook;
+    try {
+      workbook = xlsx.readFile(req.file.path, { cellDates: true });
+    } catch (err) {
+      await fs.unlink(req.file.path);
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_EXCEL',
+        message: 'The file could not be read as an Excel file',
+        details: err.message
+      });
+    }
+
+    // Validate worksheet
+    if (workbook.SheetNames.length === 0) {
+      await fs.unlink(req.file.path);
+      return res.status(400).json({
+        success: false,
+        error: 'NO_SHEETS',
+        message: 'Excel file contains no worksheets'
+      });
+    }
+
     const sheetName = workbook.SheetNames[0];
     const worksheet = workbook.Sheets[sheetName];
-    const rawData = xlsx.utils.sheet_to_json(worksheet);
+    const rawData = xlsx.utils.sheet_to_json(worksheet, { defval: null });
 
-    // Process data and add formatted dates
-    const processedData = rawData.map(row => {
-      const dateOnly = parseExcelDate(row.Date);
-      return { ...row, DateOnly: dateOnly };
-    });
+    // Validate data
+    if (!rawData || rawData.length === 0) {
+      await fs.unlink(req.file.path);
+      return res.status(400).json({
+        success: false,
+        error: 'NO_DATA',
+        message: 'Excel worksheet contains no data'
+      });
+    }
 
-    // Extract unique merchant names
+    // Process data
+    const processedData = rawData.map((row, index) => {
+      try {
+        return {
+          ...row,
+          RowIndex: index + 2, // Excel rows start at 1, header at 1
+          DateOnly: parseExcelDate(row.Date)
+        };
+      } catch (err) {
+        console.error(`Error processing row ${index}:`, err);
+        return null;
+      }
+    }).filter(row => row !== null);
+
+    // Extract merchants
     const merchants = [...new Set(
       processedData
         .map(row => row['Merchant Name'])
-        .filter(name => name && name.trim() !== '')
-    )];
+        .filter(name => name && typeof name === 'string' && name.trim() !== '')
+    )].sort();
 
-    // Store processed data in memory (in production, use a database)
-    req.app.locals.processedData = processedData;
+    // Store data in memory (for demo - use DB in production)
+    req.app.locals.fileData = {
+      originalName: req.file.originalname,
+      processedData,
+      merchants,
+      uploadTime: new Date()
+    };
 
-    // Clean up the uploaded file
-    await fs.unlink(filePath);
+    // Cleanup
+    await fs.unlink(req.file.path);
 
-    res.json({ merchants });
+    // Response
+    res.json({
+      success: true,
+      merchants,
+      count: processedData.length,
+      firstFew: processedData.slice(0, 3) // For debugging
+    });
+
   } catch (err) {
-    console.error('Upload error:', err);
-    res.status(500).json({ error: 'Failed to process file', details: err.message });
+    console.error('Upload processing error:', err);
+
+    // Cleanup if file exists
+    if (req.file) {
+      await fs.unlink(req.file.path).catch(console.error);
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'PROCESSING_ERROR',
+      message: 'An error occurred while processing the file',
+      details: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
   }
 });
 
-// Generate summary and Excel file
+/**
+ * @api {post} /generate Generate Summary
+ * @apiName GenerateSummary
+ * @apiGroup Analysis
+ * 
+ * @apiParam {String[]} selectedMerchants Array of merchant names
+ * @apiParam {Number} percentage Percentage to calculate
+ * @apiParam {String} startDate Start date (YYYY-MM-DD)
+ * @apiParam {String} endDate End date (YYYY-MM-DD)
+ * 
+ * @apiSuccess {Object[]} summary Generated summary data
+ * @apiSuccess {String} downloadUrl URL to download Excel file
+ * @apiSuccess {String} dateRange Formatted date range
+ */
 app.post('/generate', async (req, res) => {
   try {
+    // Validate input
     const { selectedMerchants, percentage, startDate, endDate } = req.body;
 
-    // Validate input
-    if (!selectedMerchants || !selectedMerchants.length) {
-      return res.status(400).json({ error: 'No merchants selected' });
-    }
-    if (!percentage || isNaN(parseFloat(percentage))) {
-      return res.status(400).json({ error: 'Invalid percentage value' });
-    }
-    if (!startDate || !endDate) {
-      return res.status(400).json({ error: 'Date range not specified' });
+    if (!selectedMerchants || !Array.isArray(selectedMerchants) || selectedMerchants.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'NO_MERCHANTS',
+        message: 'No merchants were selected'
+      });
     }
 
     const percent = parseFloat(percentage);
-    const processedData = req.app.locals.processedData;
-
-    if (!processedData || !processedData.length) {
-      return res.status(400).json({ error: 'No data available. Please upload a file first.' });
+    if (isNaN(percent) || percent < 0 || percent > 100) {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_PERCENTAGE',
+        message: 'Percentage must be a number between 0 and 100'
+      });
     }
 
-    // Filter data by date range and merchants
-    const filteredData = processedData.filter(row => {
+    if (!startDate || !endDate || !Date.parse(startDate) || !Date.parse(endDate)) {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_DATE',
+        message: 'Invalid date range provided'
+      });
+    }
+
+    // Get data from memory (from upload)
+    const fileData = req.app.locals.fileData;
+    if (!fileData || !fileData.processedData) {
+      return res.status(400).json({
+        success: false,
+        error: 'NO_DATA',
+        message: 'No data available. Please upload a file first.'
+      });
+    }
+
+    // Filter data
+    const filteredData = fileData.processedData.filter(row => {
       return (
-        row.DateOnly && 
-        row.DateOnly >= startDate && 
+        row.DateOnly &&
+        row.DateOnly >= startDate &&
         row.DateOnly <= endDate &&
         selectedMerchants.includes(row['Merchant Name'])
       );
     });
 
-    if (!filteredData.length) {
-      return res.status(404).json({ error: 'No transactions found for the selected criteria' });
+    if (filteredData.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'NO_MATCHING_DATA',
+        message: 'No transactions found for the selected criteria',
+        details: {
+          dateRange: `${startDate} to ${endDate}`,
+          merchants: selectedMerchants
+        }
+      });
     }
 
     // Calculate summary
@@ -170,7 +349,8 @@ app.post('/generate', async (req, res) => {
         summaryMap.set(merchant, {
           withdrawal: 0,
           fee: 0,
-          percentAmount: 0
+          percentAmount: 0,
+          count: 0
         });
       }
 
@@ -178,6 +358,7 @@ app.post('/generate', async (req, res) => {
       current.withdrawal += withdrawal;
       current.fee += fee;
       current.percentAmount += percentAmount;
+      current.count += 1;
     });
 
     // Convert to array format
@@ -185,7 +366,8 @@ app.post('/generate', async (req, res) => {
       Merchant: merchant,
       'Total Withdrawal Amount': values.withdrawal.toFixed(2),
       'Total Withdrawal Fees': values.fee.toFixed(2),
-      [`${percent}% Amount`]: values.percentAmount.toFixed(2)
+      [`${percent}% Amount`]: values.percentAmount.toFixed(2),
+      'Transaction Count': values.count
     }));
 
     // Add totals row
@@ -193,7 +375,8 @@ app.post('/generate', async (req, res) => {
       Merchant: 'TOTAL',
       'Total Withdrawal Amount': summaryData.reduce((sum, row) => sum + parseFloat(row['Total Withdrawal Amount']), 0).toFixed(2),
       'Total Withdrawal Fees': summaryData.reduce((sum, row) => sum + parseFloat(row['Total Withdrawal Fees']), 0).toFixed(2),
-      [`${percent}% Amount`]: summaryData.reduce((sum, row) => sum + parseFloat(row[`${percent}% Amount`]), 0).toFixed(2)
+      [`${percent}% Amount`]: summaryData.reduce((sum, row) => sum + parseFloat(row[`${percent}% Amount`]), 0).toFixed(2),
+      'Transaction Count': summaryData.reduce((sum, row) => sum + row['Transaction Count'], 0)
     };
     summaryData.push(totals);
 
@@ -202,66 +385,146 @@ app.post('/generate', async (req, res) => {
     const outputPath = path.join(outputDir, outputFilename);
 
     const wb = xlsx.utils.book_new();
-    xlsx.utils.book_append_sheet(wb, xlsx.utils.json_to_sheet(filteredData), 'Transactions');
-    xlsx.utils.book_append_sheet(wb, xlsx.utils.json_to_sheet(summaryData), 'Summary');
+    
+    // Add raw data sheet
+    const wsData = xlsx.utils.json_to_sheet(filteredData.map(row => {
+      const { RowIndex, DateOnly, ...rest } = row;
+      return rest;
+    }));
+    xlsx.utils.book_append_sheet(wb, wsData, 'Transactions');
+    
+    // Add summary sheet
+    const wsSummary = xlsx.utils.json_to_sheet(summaryData);
+    xlsx.utils.book_append_sheet(wb, wsSummary, 'Summary');
+    
+    // Write file
     xlsx.writeFile(wb, outputPath);
 
-    // Set download URL (valid for 1 hour)
+    // Set download URL (valid until server restarts)
     const downloadUrl = `/download/${outputFilename}`;
 
+    // Response
     res.json({
+      success: true,
       summary: summaryData,
       downloadUrl,
-      dateRange: `${startDate} to ${endDate}`
+      dateRange: `${startDate} to ${endDate}`,
+      stats: {
+        transactionCount: filteredData.length,
+        merchantCount: summaryMap.size
+      }
     });
+
   } catch (err) {
-    console.error('Generate error:', err);
-    res.status(500).json({ error: 'Failed to generate summary', details: err.message });
+    console.error('Summary generation error:', err);
+    res.status(500).json({
+      success: false,
+      error: 'GENERATION_ERROR',
+      message: 'Failed to generate summary',
+      details: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
   }
 });
 
-// Download generated Excel file
+/**
+ * @api {get} /download/:filename Download Excel File
+ * @apiName DownloadFile
+ * @apiGroup File
+ * 
+ * @apiParam {String} filename Filename to download
+ */
 app.get('/download/:filename', async (req, res) => {
   try {
     const filename = req.params.filename;
-    const filePath = path.join(outputDir, filename);
-
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'File not found or expired' });
+    if (!filename || !filename.match(/^summary_\d+\.xlsx$/)) {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_FILENAME',
+        message: 'Invalid filename requested'
+      });
     }
 
-    res.download(filePath, filename, (err) => {
-      if (err) {
-        console.error('Download error:', err);
-      }
-      // Clean up the file after download
-      fs.unlink(filePath).catch(console.error);
+    const filePath = path.join(outputDir, filename);
+    
+    // Verify file exists
+    try {
+      await fs.access(filePath);
+    } catch (err) {
+      return res.status(404).json({
+        success: false,
+        error: 'FILE_NOT_FOUND',
+        message: 'The requested file does not exist or has expired',
+        details: 'Generated files are temporary and removed after download'
+      });
+    }
+
+    // Set headers
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename=${filename}`);
+
+    // Stream file
+    const fileStream = fs.createReadStream(filePath);
+    fileStream.pipe(res);
+
+    // Cleanup after download completes
+    fileStream.on('end', () => {
+      fs.unlink(filePath).catch(err => {
+        console.error('Error deleting file after download:', err);
+      });
     });
+
+    fileStream.on('error', (err) => {
+      console.error('File stream error:', err);
+      fs.unlink(filePath).catch(console.error);
+      res.status(500).end();
+    });
+
   } catch (err) {
     console.error('Download error:', err);
-    res.status(500).json({ error: 'Failed to download file' });
+    res.status(500).json({
+      success: false,
+      error: 'DOWNLOAD_ERROR',
+      message: 'Failed to download file'
+    });
   }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    uptime: process.uptime(),
+    timestamp: new Date(),
+    memoryUsage: process.memoryUsage()
+  });
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-  console.error('Server error:', err);
-  res.status(500).json({ error: 'Internal server error', details: err.message });
+  console.error('Unhandled error:', err);
+  res.status(500).json({
+    success: false,
+    error: 'SERVER_ERROR',
+    message: 'Internal server error'
+  });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Upload directory: ${uploadDir}`);
-  console.log(`Output directory: ${outputDir}`);
+// Initialize and start server
+initializeDirectories().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Upload directory: ${uploadDir}`);
+    console.log(`Output directory: ${outputDir}`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  });
 });
 
-// Clean up on exit
+// Cleanup on exit
 process.on('SIGINT', async () => {
+  console.log('Shutting down server...');
   try {
-    await fs.remove(uploadDir);
-    await fs.remove(outputDir);
-    console.log('Temporary directories removed');
+    await fs.remove(tempDir);
+    console.log('Temporary files cleaned up');
     process.exit(0);
   } catch (err) {
     console.error('Cleanup error:', err);
