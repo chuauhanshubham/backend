@@ -1,134 +1,270 @@
 const express = require('express');
 const multer = require('multer');
-const XLSX = require('xlsx');
-const fs = require('fs-extra');
-const path = require('path');
+const xlsx = require('xlsx');
 const cors = require('cors');
+const path = require('path');
+const fs = require('fs-extra');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
 
-const uploadDir = path.join(__dirname, 'uploads');
-const outputDir = path.join(__dirname, 'output');
+// Configure CORS
+app.use(cors());
+app.use(express.json());
+
+// Set up temporary directories
+const uploadDir = path.join(__dirname, 'temp', 'uploads');
+const outputDir = path.join(__dirname, 'temp', 'output');
+
 fs.ensureDirSync(uploadDir);
 fs.ensureDirSync(outputDir);
 
-app.use(express.json());
-app.use(cors());
-app.use('/output', express.static(outputDir));
-
-let globalData = [];
-
+// Configure multer for file uploads
 const storage = multer.diskStorage({
   destination: uploadDir,
-  filename: (req, file, cb) => cb(null, 'input.xlsx')
+  filename: (req, file, cb) => {
+    const uniqueName = `${uuidv4()}${path.extname(file.originalname)}`;
+    cb(null, uniqueName);
+  }
 });
-const upload = multer({ storage });
 
-function extractDateOnly(value) {
-  if (!value) return '';
-  if (typeof value === 'number') {
-    const excelEpoch = new Date(Date.UTC(1899, 11, 30));
-    return new Date(excelEpoch.getTime() + (value - 1) * 86400000).toISOString().slice(0, 10);
+const upload = multer({ 
+  storage,
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.includes('excel') || file.mimetype.includes('spreadsheet') || 
+        path.extname(file.originalname).match(/\.(xlsx|xls)$/)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only Excel files are allowed!'), false);
+    }
+  },
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+});
+
+// Clean up temp files on server start
+async function cleanTempFiles() {
+  try {
+    await fs.emptyDir(uploadDir);
+    await fs.emptyDir(outputDir);
+    console.log('Temporary directories cleaned');
+  } catch (err) {
+    console.error('Error cleaning temp directories:', err);
   }
-  if (typeof value === 'string' && /^\d{2}-\d{2}-\d{4}/.test(value)) {
-    const [d, m, y] = value.split(' ')[0].split('-');
-    const date = new Date(`${y}-${m}-${d}`);
-    return isNaN(date.getTime()) ? '' : date.toISOString().slice(0, 10);
-  }
-  const parsed = new Date(value);
-  return isNaN(parsed.getTime()) ? '' : parsed.toISOString().slice(0, 10);
 }
 
-app.post('/upload', upload.single('file'), (req, res) => {
-  const filePath = req.file.path;
-  const workbook = XLSX.readFile(filePath);
-  const sheet = workbook.Sheets[workbook.SheetNames[0]];
-  const rawData = XLSX.utils.sheet_to_json(sheet);
+cleanTempFiles();
 
-  globalData = rawData.map(row => ({ ...row, DateOnly: extractDateOnly(row['Date']) }));
-  const merchants = [...new Set(globalData.map(row => row['Merchant Name']).filter(Boolean))];
-  res.json({ merchants });
+// Helper function to parse dates from Excel
+function parseExcelDate(excelDate) {
+  try {
+    if (typeof excelDate === 'number') {
+      // Excel dates are numbers where 1 = 1900-01-01
+      const excelEpoch = new Date(1899, 11, 30);
+      const date = new Date(excelEpoch.getTime() + (excelDate - 1) * 86400000);
+      return date.toISOString().split('T')[0];
+    } else if (typeof excelDate === 'string') {
+      // Handle string dates in format "DD-MM-YYYY"
+      const parts = excelDate.split(/[-/]/);
+      if (parts.length === 3) {
+        const date = new Date(`${parts[2]}-${parts[1]}-${parts[0]}`);
+        return date.toISOString().split('T')[0];
+      }
+    }
+    // Try parsing as ISO date
+    const date = new Date(excelDate);
+    return date.toISOString().split('T')[0];
+  } catch (err) {
+    return null;
+  }
+}
+
+// API Endpoints
+
+// Upload Excel file and extract merchants
+app.post('/upload', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const filePath = req.file.path;
+    const workbook = xlsx.readFile(filePath);
+    const sheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[sheetName];
+    const rawData = xlsx.utils.sheet_to_json(worksheet);
+
+    // Process data and add formatted dates
+    const processedData = rawData.map(row => {
+      const dateOnly = parseExcelDate(row.Date);
+      return { ...row, DateOnly: dateOnly };
+    });
+
+    // Extract unique merchant names
+    const merchants = [...new Set(
+      processedData
+        .map(row => row['Merchant Name'])
+        .filter(name => name && name.trim() !== '')
+    )];
+
+    // Store processed data in memory (in production, use a database)
+    req.app.locals.processedData = processedData;
+
+    // Clean up the uploaded file
+    await fs.unlink(filePath);
+
+    res.json({ merchants });
+  } catch (err) {
+    console.error('Upload error:', err);
+    res.status(500).json({ error: 'Failed to process file', details: err.message });
+  }
 });
 
+// Generate summary and Excel file
 app.post('/generate', async (req, res) => {
-  const { selectedMerchants, percentage, startDate, endDate } = req.body;
+  try {
+    const { selectedMerchants, percentage, startDate, endDate } = req.body;
 
-  if (!selectedMerchants || !startDate || !endDate || !percentage) {
-    return res.status(400).json({ error: 'Missing fields' });
-  }
+    // Validate input
+    if (!selectedMerchants || !selectedMerchants.length) {
+      return res.status(400).json({ error: 'No merchants selected' });
+    }
+    if (!percentage || isNaN(parseFloat(percentage))) {
+      return res.status(400).json({ error: 'Invalid percentage value' });
+    }
+    if (!startDate || !endDate) {
+      return res.status(400).json({ error: 'Date range not specified' });
+    }
 
-  const percent = parseFloat(percentage);
-  if (isNaN(percent)) return res.status(400).json({ error: 'Invalid percentage' });
+    const percent = parseFloat(percentage);
+    const processedData = req.app.locals.processedData;
 
-  const normalizedStart = new Date(startDate).toISOString().slice(0, 10);
-  const normalizedEnd = new Date(endDate).toISOString().slice(0, 10);
+    if (!processedData || !processedData.length) {
+      return res.status(400).json({ error: 'No data available. Please upload a file first.' });
+    }
 
-  const dateFiltered = globalData.filter(row =>
-    row.DateOnly >= normalizedStart && row.DateOnly <= normalizedEnd
-  );
+    // Filter data by date range and merchants
+    const filteredData = processedData.filter(row => {
+      return (
+        row.DateOnly && 
+        row.DateOnly >= startDate && 
+        row.DateOnly <= endDate &&
+        selectedMerchants.includes(row['Merchant Name'])
+      );
+    });
 
-  const summaryData = [];
-  const filteredData = [];
+    if (!filteredData.length) {
+      return res.status(404).json({ error: 'No transactions found for the selected criteria' });
+    }
 
-  let grandW = 0, grandF = 0, grandP = 0;
+    // Calculate summary
+    const summaryMap = new Map();
 
-  for (const merchant of selectedMerchants) {
-    const rows = dateFiltered.filter(row => row['Merchant Name'] === merchant);
-
-    let totalW = 0, totalF = 0, totalP = 0;
-
-    rows.forEach(row => {
-      const withdrawal = parseFloat(row['Withdrawal Amount'] || 0);
-      const fee = parseFloat(row['Withdrawal Fees'] || 0);
+    filteredData.forEach(row => {
+      const merchant = row['Merchant Name'];
+      const withdrawal = parseFloat(row['Withdrawal Amount']) || 0;
+      const fee = parseFloat(row['Withdrawal Fees']) || 0;
       const percentAmount = withdrawal * percent / 100;
 
-      row[`${percentage}% Amount`] = percentAmount.toFixed(2);
-      totalW += withdrawal;
-      totalF += fee;
-      totalP += percentAmount;
-      filteredData.push(row);
+      if (!summaryMap.has(merchant)) {
+        summaryMap.set(merchant, {
+          withdrawal: 0,
+          fee: 0,
+          percentAmount: 0
+        });
+      }
+
+      const current = summaryMap.get(merchant);
+      current.withdrawal += withdrawal;
+      current.fee += fee;
+      current.percentAmount += percentAmount;
     });
 
-    summaryData.push({
-      'Merchant': merchant,
-      'Total Withdrawal Amount': totalW.toFixed(2),
-      'Total Withdrawal Fees': totalF.toFixed(2),
-      [`${percentage}% Amount`]: totalP.toFixed(2)
+    // Convert to array format
+    const summaryData = Array.from(summaryMap.entries()).map(([merchant, values]) => ({
+      Merchant: merchant,
+      'Total Withdrawal Amount': values.withdrawal.toFixed(2),
+      'Total Withdrawal Fees': values.fee.toFixed(2),
+      [`${percent}% Amount`]: values.percentAmount.toFixed(2)
+    }));
+
+    // Add totals row
+    const totals = {
+      Merchant: 'TOTAL',
+      'Total Withdrawal Amount': summaryData.reduce((sum, row) => sum + parseFloat(row['Total Withdrawal Amount']), 0).toFixed(2),
+      'Total Withdrawal Fees': summaryData.reduce((sum, row) => sum + parseFloat(row['Total Withdrawal Fees']), 0).toFixed(2),
+      [`${percent}% Amount`]: summaryData.reduce((sum, row) => sum + parseFloat(row[`${percent}% Amount`]), 0).toFixed(2)
+    };
+    summaryData.push(totals);
+
+    // Generate Excel file
+    const outputFilename = `summary_${Date.now()}.xlsx`;
+    const outputPath = path.join(outputDir, outputFilename);
+
+    const wb = xlsx.utils.book_new();
+    xlsx.utils.book_append_sheet(wb, xlsx.utils.json_to_sheet(filteredData), 'Transactions');
+    xlsx.utils.book_append_sheet(wb, xlsx.utils.json_to_sheet(summaryData), 'Summary');
+    xlsx.writeFile(wb, outputPath);
+
+    // Set download URL (valid for 1 hour)
+    const downloadUrl = `/download/${outputFilename}`;
+
+    res.json({
+      summary: summaryData,
+      downloadUrl,
+      dateRange: `${startDate} to ${endDate}`
     });
-
-    grandW += totalW;
-    grandF += totalF;
-    grandP += totalP;
+  } catch (err) {
+    console.error('Generate error:', err);
+    res.status(500).json({ error: 'Failed to generate summary', details: err.message });
   }
-
-  summaryData.push({
-    'Merchant': 'TOTAL',
-    'Total Withdrawal Amount': grandW.toFixed(2),
-    'Total Withdrawal Fees': grandF.toFixed(2),
-    [`${percentage}% Amount`]: grandP.toFixed(2)
-  });
-
-  if (filteredData.length === 0 && summaryData.length === 0) {
-    return res.status(404).json({ error: 'No data found in range' });
-  }
-
-  const wb = XLSX.utils.book_new();
-  const wsData = XLSX.utils.json_to_sheet(filteredData);
-  XLSX.utils.book_append_sheet(wb, wsData, 'Filtered Data');
-
-  const wsSummary = XLSX.utils.json_to_sheet(summaryData);
-  XLSX.utils.book_append_sheet(wb, wsSummary, 'Summary');
-
-  const outputPath = path.join(outputDir, 'filtered_output.xlsx');
-  XLSX.writeFile(wb, outputPath);
-
-  res.json({
-    summary: summaryData,
-    downloadUrl: '/output/filtered_output.xlsx',
-    dateRange: `${normalizedStart} to ${normalizedEnd}`
-  });
 });
+
+// Download generated Excel file
+app.get('/download/:filename', async (req, res) => {
+  try {
+    const filename = req.params.filename;
+    const filePath = path.join(outputDir, filename);
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found or expired' });
+    }
+
+    res.download(filePath, filename, (err) => {
+      if (err) {
+        console.error('Download error:', err);
+      }
+      // Clean up the file after download
+      fs.unlink(filePath).catch(console.error);
+    });
+  } catch (err) {
+    console.error('Download error:', err);
+    res.status(500).json({ error: 'Failed to download file' });
+  }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Server error:', err);
+  res.status(500).json({ error: 'Internal server error', details: err.message });
+});
+
+// Start server
 app.listen(PORT, () => {
-  console.log(`✅ Server running at http://localhost:${PORT}`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Upload directory: ${uploadDir}`);
+  console.log(`Output directory: ${outputDir}`);
+});
+
+// Clean up on exit
+process.on('SIGINT', async () => {
+  try {
+    await fs.remove(uploadDir);
+    await fs.remove(outputDir);
+    console.log('Temporary directories removed');
+    process.exit(0);
+  } catch (err) {
+    console.error('Cleanup error:', err);
+    process.exit(1);
+  }
 });
