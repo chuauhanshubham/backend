@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Merchant Filter</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 20px;
+    }
+    .container {
+      display: flex;
+      gap: 40px;
+      align-items: flex-start;
+    }
+    #filterSection, #summarySection {
+      width: 48%;
+      border: 1px solid #ccc;
+      padding: 15px;
+      border-radius: 8px;
+      background: #f9f9f9;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+    }
+    th, td {
+      border: 1px solid #aaa;
+      padding: 8px;
+      text-align: center;
+    }
+    button {
+      margin-top: 10px;
+      padding: 8px 16px;
+      cursor: pointer;
+    }
+    .date-range {
+      font-weight: bold;
+      margin-bottom: 10px;
+      color: #333;
+    }
+  </style>
+</head>
+<body>
+
+  <h2>Upload Excel</h2>
+  <form id="uploadForm" enctype="multipart/form-data">
+    <input type="file" name="file" required />
+    <button type="submit">Upload</button>
+  </form>
+
+  <div class="container" style="display: none;" id="mainContainer">
+    <div id="filterSection">
+      <h3>Filter Options</h3>
+
+      <label>Select Merchants:</label><br />
+      <button type="button" onclick="toggleAllMerchants()">Select All</button><br /><br />
+      <div id="merchantList"></div>
+
+      <label>Enter Percentage:</label><br />
+      <input type="number" id="percentage" step="0.01" value="4" required /><br /><br />
+
+      <label>Select Date Range:</label><br />
+      <input type="date" id="startDate" required /> to
+      <input type="date" id="endDate" required /><br /><br />
+
+      <button type="button" onclick="generateFile()">Generate Summary</button>
+    </div>
+
+    <div id="summarySection" style="display: none;">
+      <h3>Merchant Summary:</h3>
+      <div class="date-range" id="dateRangeLabel"></div>
+      <table id="summaryTable">
+        <thead>
+          <tr>
+            <th>Merchant</th>
+            <th>Total Withdrawal</th>
+            <th>Total Fees</th>
+            <th>% Amount</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+        <tfoot>
+          <tr>
+            <th>Total</th>
+            <th id="totalWithdrawal">0.00</th>
+            <th id="totalFees">0.00</th>
+            <th id="totalPercent">0.00</th>
+          </tr>
+        </tfoot>
+      </table>
+      <button onclick="downloadExcel()">Download Excel File</button>
+    </div>
+  </div>
+
+  <script>
+    const uploadForm = document.getElementById('uploadForm');
+    const merchantListDiv = document.getElementById('merchantList');
+    const filterSection = document.getElementById('filterSection');
+    const summarySection = document.getElementById('summarySection');
+    const mainContainer = document.getElementById('mainContainer');
+    const dateRangeLabel = document.getElementById('dateRangeLabel');
+
+    let downloadLink = '';
+    let allSelected = true;
+
+    uploadForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const formData = new FormData(uploadForm);
+      const res = await fetch('/upload', { method: 'POST', body: formData });
+      const { merchants } = await res.json();
+
+      mainContainer.style.display = 'flex';
+      merchantListDiv.innerHTML = merchants.map(m => `
+        <label><input type="checkbox" value="${m}" checked /> ${m}</label><br />
+      `).join('');
+      toggleButtonText();
+    });
+
+    function toggleAllMerchants() {
+      const checkboxes = document.querySelectorAll('#merchantList input[type="checkbox"]');
+      checkboxes.forEach(cb => cb.checked = !allSelected);
+      allSelected = !allSelected;
+      toggleButtonText();
+    }
+
+    function toggleButtonText() {
+      const button = document.querySelector('button[onclick="toggleAllMerchants()"]');
+      button.textContent = allSelected ? 'Uncheck All' : 'Select All';
+    }
+
+    async function generateFile() {
+      const selectedMerchants = Array.from(
+        document.querySelectorAll('#merchantList input:checked')
+      ).map(cb => cb.value);
+
+      const percentage = document.getElementById('percentage').value;
+      const startDate = document.getElementById('startDate').value;
+      const endDate = document.getElementById('endDate').value;
+
+      if (!selectedMerchants.length || !startDate || !endDate) {
+        alert("Please select all fields.");
+        return;
+      }
+
+      try {
+        const res = await fetch('/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ selectedMerchants, percentage, startDate, endDate })
+        });
+
+        if (!res.ok) {
+          const error = await res.json();
+          alert(error.error || "Unknown error");
+          return;
+        }
+
+        const { summary, downloadUrl, dateRange } = await res.json();
+        downloadLink = downloadUrl;
+        dateRangeLabel.textContent = `Date Range: ${dateRange}`;
+
+        const tbody = document.querySelector('#summaryTable tbody');
+        const tfoot = document.querySelector('#summaryTable tfoot');
+        tbody.innerHTML = '';
+
+        let totalW = 0, totalF = 0, totalP = 0;
+
+        summary.forEach(row => {
+          const percentKey = Object.keys(row).find(k => k.endsWith('% Amount'));
+          const w = parseFloat(row['Total Withdrawal Amount']);
+          const f = parseFloat(row['Total Withdrawal Fees']);
+          const p = parseFloat(row[percentKey]);
+
+          totalW += w;
+          totalF += f;
+          totalP += p;
+
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${row['Merchant']}</td>
+            <td>${w.toFixed(2)}</td>
+            <td>${f.toFixed(2)}</td>
+            <td>${p.toFixed(2)}</td>
+          `;
+          tbody.appendChild(tr);
+        });
+
+        document.getElementById('totalWithdrawal').textContent = totalW.toFixed(2);
+        document.getElementById('totalFees').textContent = totalF.toFixed(2);
+        document.getElementById('totalPercent').textContent = totalP.toFixed(2);
+
+        summarySection.style.display = 'block';
+      } catch (err) {
+        alert("Failed to generate summary.");
+        console.error(err);
+      }
+    }
+
+    function downloadExcel() {
+      if (downloadLink) {
+        const a = document.createElement('a');
+        a.href = downloadLink;
+        a.download = 'filtered_output.xlsx';
+        a.click();
+      }
+    }
+  </script>
+</body>
+</html>
